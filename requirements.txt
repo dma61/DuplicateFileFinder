@@ -1,2 +1,4 @@
+# install the packages with: pip install -r requirements.txt
+
 flask
 send2trash
