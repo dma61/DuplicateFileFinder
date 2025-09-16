@@ -1,3 +1,8 @@
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/damansvelder)
+[![PayPal](https://img.shields.io/badge/PayPal-Donate-blue.svg?logo=paypal)](https://paypal.me/mansvelder)
+
+*If this project helped you, please consider a small donation. If you run into issues or have ideas, open an issue: https://github.com/dma61/DuplicateFileFinder/issues*
+
 # DuplicateFileFinder
 
 Tools for finding and managing duplicate files on Windows with a simple local web UI.
