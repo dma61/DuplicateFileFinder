@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# DuplicateFileSizeFinder — scan en beheer exacte duplicaten op basis van grootte + SHA-256
+# Vereisten: pip install flask send2trash
+
 import os
 import sys
 import stat
@@ -8,7 +12,7 @@ import threading
 import time
 from collections import defaultdict, namedtuple
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Callable
 
 from flask import Flask, request, jsonify, render_template_string
 from send2trash import send2trash
@@ -100,11 +104,9 @@ STATUS = {
     "suggest_min_size": None,
     "error": None,
 }
-
 def set_status(**kwargs):
     with STATUS_LOCK:
         STATUS.update(kwargs)
-
 def get_status():
     with STATUS_LOCK:
         return dict(STATUS)
@@ -122,6 +124,10 @@ DEFAULT_EXCLUDES = [
 DEFAULT_EXCLUDES += onedrive_paths()  # OneDrive standaard uitsluiten
 
 RESUME_EVENT = threading.Event()
+ABORT_EVENT = threading.Event()   # om lopende run te stoppen bij herstart
+
+class Cancelled(Exception):
+    """Signaaltje om lopende scan te beëindigen (herstart)."""
 
 def find_duplicates_streaming(
     root: str,
@@ -139,6 +145,8 @@ def find_duplicates_streaming(
                budget_seconds=time_budget_sec, elapsed_seconds=0)
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        if ABORT_EVENT.is_set():
+            raise Cancelled()
         if excludes:
             if is_within_excludes(dirpath, excludes):
                 dirnames[:] = []
@@ -146,6 +154,8 @@ def find_duplicates_streaming(
             dirnames[:] = [d for d in dirnames if not is_within_excludes(os.path.join(dirpath, d), excludes)]
 
         for name in filenames:
+            if ABORT_EVENT.is_set():
+                raise Cancelled()
             full = os.path.join(dirpath, name)
             try:
                 if not os.path.isfile(full) or os.path.islink(full):
@@ -178,15 +188,24 @@ def find_duplicates_streaming(
     avg_per_file = None
 
     for size, paths in jobs_all:
-        # Als minsize inmiddels hoger is dan deze bucket, alles in deze bucket als 'afgehandeld' tellen
+        if ABORT_EVENT.is_set():
+            raise Cancelled()
+
+        # als min-size inmiddels hoger is dan deze bucket, tel deze hele bucket als afgehandeld
         if size < min_size_ref():
             done += len(paths)
-            set_status(hash_done=done,
-                       elapsed_seconds=int(time.time() - started),
-                       eta_seconds=max(int((total_to_hash - done) * (avg_per_file or 0)), 0) if (avg_per_file and total_to_hash > done) else None)
+            set_status(
+                hash_done=done,
+                elapsed_seconds=int(time.time() - started),
+                eta_seconds=max(int((total_to_hash - done) * (avg_per_file or 0)), 0)
+                if (avg_per_file and total_to_hash > done) else None
+            )
             continue
 
         for p in paths:
+            if ABORT_EVENT.is_set():
+                raise Cancelled()
+
             elapsed = time.time() - started
             remaining_budget = time_budget_sec - elapsed
 
@@ -230,6 +249,15 @@ def find_duplicates_streaming(
 # ===================== FLASK APP (UI) =====================
 app = Flask(__name__)
 
+# Links + labels (geen persoonlijke of gebruikersnaam in de anchor-tekst)
+REPO_URL     = "https://github.com/dma61/DuplicateFileFinder"
+ISSUES_URL   = "https://github.com/dma61/DuplicateFileFinder/issues"
+KO_FI_URL    = "https://ko-fi.com/damansvelder"
+PAYPAL_URL   = "https://paypal.me/mansvelder"
+KO_FI_LABEL  = "Ko-fi"
+PAYPAL_LABEL = "PayPal"
+
+# Globals
 SCAN_ROOT = "C:\\"
 CURRENT_MIN_SIZE = 10 * 1024 * 1024
 TIME_BUDGET_SEC = 60 * 60
@@ -244,7 +272,31 @@ README_HTML = """
 • Verwijderen gaat <b>naar de prullenbak</b> (Send2Trash).<br>
 • Standaard uitgesloten: systeemmappen + OneDrive-mappen. Cloud-placeholders worden <i>niet</i> gehashed (tenzij <code>--include-cloud</code>).<br>
 • Tijdbudget: {{budget}} min. Als de ETA het budget overschrijdt kun je de <b>minimale bestandsgrootte</b> verhogen en direct hervatten.<br>
-• CLI: <code>dup_finder.py --root C:\\ --min-size 10485760 --time-budget-min 60 [--no-excludes] [--add-exclude "pad"] [--include-cloud]</code>
+• CLI: <code>dup_finder.py --root C:\\ --min-size 10485760 --time-budget-min 60 [--no-excludes] [--add-exclude "pad"] [--include-cloud]</code><br>
+<hr>
+<b><span style="color:#d00">Support</span></b> ·
+<a href="{{ko_fi}}" target="_blank">{{ko_fi_label}}</a> ·
+<a href="{{paypal}}" target="_blank">{{paypal_label}}</a> ·
+<a href="{{issues}}" target="_blank">Issues</a> ·
+<a href="{{repo}}" target="_blank">GitHub repo</a>
+<!-- <br><i>(If this tool <span style="color:#d00">helped</span> you, please <span style="color:#d00">consider supporting</span> it. If something went wrong or you have suggestions for improvement, <a href="https://github.com/dma61/DuplicateFileFinder/issues" target="_blank"> please open an issue.)</i></br>-->
+<div style="margin:.6rem 0 0 0;padding:.6rem .75rem;background:#f7faff;border:1px solid #e2e8ff;border-radius:.5rem;">
+  <div style="font-style:italic;margin:0 0 .45rem 0;">If this tool helped you or if something went wrong / you have suggestions:</div>
+  <div>
+    <a href="{{ko_fi}}" target="_blank"
+       style="display:inline-block;padding:.35rem .7rem;border:1px solid #d0d7ff;border-radius:.4rem;text-decoration:none;">
+       Support
+    </a>
+    <a href="{{issues}}" target="_blank"
+       style="display:inline-block;padding:.35rem .7rem;border:1px solid #d0d7ff;border-radius:.4rem;text-decoration:none;margin-left:.5rem;">
+       Open an issue
+    </a>
+  </div>
+</div>
+
+
+
+
 """
 
 def min_size_ref() -> int:
@@ -272,6 +324,8 @@ PAGE_WAIT = """
  input[type=number]{width:12rem;padding:.3rem}
  button{padding:.35rem .65rem;border-radius:.35rem;border:1px solid #777;background:#f7f7f7;cursor:pointer}
  button.primary{background:#e8f0ff;border-color:#7da7ff}
+ .opt{border:1px solid #ddd;border-radius:.5rem;padding:.35rem .6rem;display:inline-flex;gap:.35rem;align-items:center;margin:.15rem .25rem;}
+ .opt input{margin:0}
 </style>
 <script>
 async function tick(){
@@ -328,13 +382,37 @@ async function resume(action){
   const s = await r.json();
   if(!s.ok){ alert(s.error || 'Actie mislukt'); }
 }
+
+async function restartWithNewMin(){
+  // lees radio of custom (MB)
+  const picked = document.querySelector('input[name=optmb]:checked');
+  const mb = picked ? parseFloat(picked.value) : parseFloat(document.getElementById('customMB').value);
+  if (isNaN(mb) || mb < 1){ alert('Voer een geldige waarde (>= 1 MB) in.'); return; }
+  const bytes = Math.floor(mb * 1024 * 1024);
+  const r = await fetch('/restart', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({min_size_bytes: bytes})});
+  const d = await r.json();
+  if(!d.ok){ alert(d.error || 'Kon niet herstarten.'); }
+}
 window.addEventListener('load', tick);
 </script>
 </head>
 <body>
 <h1>🔍 Bezig met scannen duplicate files (op grootte)…</h1>
+
+<div class="card" style="margin-bottom:1rem;">
+  <b>Snel aanpassen (minimale grootte)</b>
+  <div>
+    {% for mb in [10,20,50,100,500] %}
+      <label class="opt"><input type="radio" name="optmb" value="{{mb}}" {% if mb==10 %}checked{% endif %}> {{mb}} MB</label>
+    {% endfor %}
+    <label class="opt">Custom: <input id="customMB" type="number" min="1" step="1" value="10" style="width:6rem"> MB</label>
+    <button class="primary" onclick="restartWithNewMin()">Herstart met nieuwe waarde</button>
+  </div>
+  <div class="muted">Huidig minimum: <b id="minsize">{{min_size}}</b> bytes</div>
+</div>
+
 <div class="card">
-  <p class="muted">Root: <span class="mono">{{root}}</span> · Budget: {{budget_min}} min · Min. grootte: <b id="minsize">{{min_size}}</b> bytes</p>
+  <p class="muted">Root: <span class="mono">{{root}}</span> · Budget: {{budget_min}} min · Min. grootte: <b>{{min_size}}</b> bytes</p>
 
   <div>
     <div class="row"><b>Tijd</b><span id="timelabel" class="muted">0 % van budget</span></div>
@@ -423,7 +501,9 @@ function delAllSelected(){
 <p class="muted">Min. grootte: {{min_size}} bytes · Tijdsverbruik: {{elapsed_min}} min · Budget: {{budget_min}} min</p>
 
 <h3>README</h3>
-<div class="muted" style="margin-bottom:.75rem;">{{ readme|safe }}</div>
+<div class="muted" style="margin-bottom:.75rem;">
+  {{ readme|safe }}
+</div>
 
 <table>
   <thead>
@@ -467,8 +547,7 @@ function delAllSelected(){
 </html>
 """
 
-app = Flask(__name__)
-
+# --------- Routes ---------
 @app.route("/")
 def index():
     s = get_status()
@@ -481,7 +560,14 @@ def index():
             min_size=s["min_size"],
             elapsed_min=elapsed_min,
             budget_min=int(TIME_BUDGET_SEC/60),
-            readme=render_template_string(README_HTML, root=SCAN_ROOT, budget=int(TIME_BUDGET_SEC/60)),
+            readme=render_template_string(
+                README_HTML,
+                root=SCAN_ROOT,
+                budget=int(TIME_BUDGET_SEC/60),
+                ko_fi=KO_FI_URL, paypal=PAYPAL_URL,
+                ko_fi_label=KO_FI_LABEL, paypal_label=PAYPAL_LABEL,
+                issues=ISSUES_URL, repo=REPO_URL
+            ),
             human=human,
             enc=encode_path
         )
@@ -491,7 +577,14 @@ def index():
             root=SCAN_ROOT,
             budget_min=int(TIME_BUDGET_SEC/60),
             min_size=s["min_size"],
-            readme=render_template_string(README_HTML, root=SCAN_ROOT, budget=int(TIME_BUDGET_SEC/60))
+            readme=render_template_string(
+                README_HTML,
+                root=SCAN_ROOT,
+                budget=int(TIME_BUDGET_SEC/60),
+                ko_fi=KO_FI_URL, paypal=PAYPAL_URL,
+                ko_fi_label=KO_FI_LABEL, paypal_label=PAYPAL_LABEL,
+                issues=ISSUES_URL, repo=REPO_URL
+            )
         )
 
 @app.get("/status")
@@ -515,6 +608,52 @@ def resume():
         RESUME_EVENT.set()
         return jsonify(ok=True)
     return jsonify(ok=False, error="onbekende actie"), 400
+
+@app.post("/restart")
+def restart():
+    """Herstart scan met nieuwe minimumgrootte (in bytes)."""
+    global CURRENT_MIN_SIZE, GROUPS, STARTED_AT  # <-- global eerst!
+
+    data = request.get_json(silent=True) or {}
+    default_min = CURRENT_MIN_SIZE  # veilig default, na global
+
+    try:
+        new_min = int(data.get("min_size_bytes", default_min))
+        if new_min < 1024 * 1024:
+            return jsonify(ok=False, error="Minimum is 1 MB"), 400
+    except Exception:
+        return jsonify(ok=False, error="Ongeldige waarde"), 400
+
+    CURRENT_MIN_SIZE = new_min
+    GROUPS = []
+    STARTED_AT = datetime.now()
+
+    # lopende run afbreken en nieuwe starten
+    ABORT_EVENT.set()
+    set_status(state="scanning", started=STARTED_AT.isoformat(),
+               min_size=CURRENT_MIN_SIZE, budget_seconds=TIME_BUDGET_SEC,
+               walk_scanned=0, walk_skipped=0, hash_total=0, hash_done=0,
+               eta_seconds=None, message="Herstart met nieuw minimum")
+
+    def worker():
+        try:
+            ABORT_EVENT.clear()
+            g = find_duplicates_streaming(
+                root=SCAN_ROOT,
+                min_size_ref=lambda: CURRENT_MIN_SIZE,
+                excludes=EXCLUDES,
+                include_cloud=INCLUDE_CLOUD,
+                time_budget_sec=TIME_BUDGET_SEC,
+            )
+            global GROUPS
+            GROUPS = g
+        except Cancelled:
+            pass
+        except Exception as e:
+            set_status(state="error", error=str(e))
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify(ok=True)
 
 @app.get("/open")
 def open_folder():
@@ -559,14 +698,6 @@ def delete_batch():
     return jsonify(ok=(ok == len(tokens)), deleted=ok, error="; ".join(errors))
 
 # ===================== MAIN =====================
-SCAN_ROOT = "C:\\"
-CURRENT_MIN_SIZE = 10 * 1024 * 1024
-TIME_BUDGET_SEC = 60 * 60
-EXCLUDES: list[str] = []
-INCLUDE_CLOUD = False
-GROUPS: list[Group] = []
-STARTED_AT: datetime = datetime.now()
-
 def main():
     parser = argparse.ArgumentParser(description="Zoek en beheer duplicaatbestanden (Windows).")
     parser.add_argument("--root", default="C:\\", help="Startmap (standaard: C:\\)")
@@ -611,11 +742,12 @@ def main():
                 include_cloud=INCLUDE_CLOUD,
                 time_budget_sec=TIME_BUDGET_SEC,
             )
+        except Cancelled:
+            pass
         except Exception as e:
             set_status(state="error", error=str(e))
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+    threading.Thread(target=worker, daemon=True).start()
 
     webbrowser.open("http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, debug=False)
